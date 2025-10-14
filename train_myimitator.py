@@ -26,6 +26,11 @@ import math
     在服务器上训练只需上传这一个文件即可
 '''
 
+if torch.cuda.is_available():
+    print("✅ CUDA is available. Ready to train.")
+else:
+    print("❌ CUDA not detected. Check cluster GPU settings.")
+
 # Set random seed for reproducibility
 manualSeed = 999
 # manualSeed = random.randint(1, 10000) # use if you want new results
@@ -34,14 +39,14 @@ random.seed(manualSeed)
 torch.manual_seed(manualSeed)
 
 # Batch size during training
-batch_size = 16
+batch_size = 8
 image_size = 512
-num_epochs = 1000
+num_epochs = 50
 lr = 0.01
 ngpu = 2
-
+print("start loading root")
 dataset_root = "/db-mnt/mnt/efs-mount/home/xiangxzou/"
-params_path = os.path.join(dataset_root, "labels_first.json")
+params_path = os.path.join(dataset_root, "labels.json")
 images_root = os.path.join(dataset_root, "images")
 splits_root = os.path.join(dataset_root, "splits")
 train_index_file = os.path.join(splits_root, "train.json")
@@ -98,7 +103,7 @@ class Imitator_Dataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-
+print("start loading dataset")
 train_dataset = Imitator_Dataset(params_path, images_root, train_index_file)
 if os.path.exists(val_index_file):
     val_dataset = Imitator_Dataset(params_path, images_root, val_index_file)
@@ -293,7 +298,7 @@ class MyImitator(nn.Module):
         super(MyImitator, self).__init__()
 
         # 1.加载配置文件
-        with open("./checkpoint/myimitator-512.json", "r", encoding='utf-8') as reader:
+        with open("/Workspace/Users/xiangxzou@global.tencent.com/face2parameter/checkpoint/myimitator-512.json", "r", encoding='utf-8') as reader:
             text = reader.read()
         self.conf = BigGANConfig()
         for key, value in json.loads(text).items():
@@ -303,7 +308,7 @@ class MyImitator(nn.Module):
         # self.embeddings = nn.Linear(config.num_classes, config.continuous_params_size, bias=False)
 
         ch = self.conf.channel_width
-        condition_vector_dim = 223
+        condition_vector_dim = 205
 
         self.gen_z = snlinear(in_features=condition_vector_dim, out_features=4*4*16*ch, eps=self.conf.eps)
         layers = []
@@ -428,7 +433,7 @@ optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5,
 
 # 每50个epoch衰减10%
 # scheduler = lr_scheduler.StepLR(optimizer, step_size=len(train_dataloader) * 50, gamma=0.9)
-
+print("start training")
 total_step = len(train_dataloader)
 imitator.train()
 train_loss_list = []
