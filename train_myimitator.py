@@ -22,6 +22,8 @@ import time
 import copy
 import math
 
+from torch.cuda.amp import autocast, GradScaler
+
 '''
     在服务器上训练只需上传这一个文件即可
 '''
@@ -119,6 +121,8 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset is not None else None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+use_amp = device.type == 'cuda'
+scaler = GradScaler(enabled=use_amp)
 
 
 # real_batch = next(iter(val_dataloader))
@@ -444,17 +448,20 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         params = params.to(device)
         img = img.to(device)
-        outputs = imitator(params)
-        loss = criterion(outputs, img)
-        loss.backward()
-        optimizer.step()
+        with autocast(enabled=use_amp):
+            outputs = imitator(params)
+            loss = criterion(outputs, img)
+        loss_value = loss.item()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         if (i % 10) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
-                  .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), time.time() - start))
+                  .format(epoch + 1, num_epochs, i + 1, total_step, loss_value, time.time() - start))
             start = time.time()
 
-    train_loss_list.append(loss.item())
+    train_loss_list.append(loss_value)
     if val_dataloader is not None:
         imitator.eval()
         with torch.no_grad():
@@ -462,8 +469,9 @@ for epoch in range(num_epochs):
             for i, (params, img) in enumerate(val_dataloader):
                 params = params.to(device)
                 img = img.to(device)
-                outputs = imitator(params)
-                loss = criterion(outputs, img)
+                with autocast(enabled=use_amp):
+                    outputs = imitator(params)
+                    loss = criterion(outputs, img)
                 val_loss += loss.item()
                 if i == 1:
                     vutils.save_image(
@@ -491,4 +499,4 @@ for epoch in range(num_epochs):
         if (epoch % 10) == 0 or (epoch + 1) == num_epochs:
             torch.save(imitator.state_dict(),
                        os.path.join(model_dir, 'epoch_{}_train_loss_{:.6f}_file.pt'.format(
-                           epoch, loss.item())))
+                           epoch, loss_value)))
