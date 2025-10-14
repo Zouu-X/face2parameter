@@ -39,7 +39,7 @@ torch.manual_seed(manualSeed)
 # Batch size during training
 batch_size = 16
 image_size = 512
-num_epochs = 1000
+num_epochs = 50
 lr = 0.01
 ngpu = 2
 
@@ -129,7 +129,7 @@ mlflow.log_params({
     "train_size": len(train_dataset),
     "val_size": len(val_dataset) if val_dataset is not None else 0,
     "image_resolution": 512,
-    "condition_vector_dim": 223,
+    "condition_vector_dim": 205,
 })
 
 # Keep track of best model for MLflow logging
@@ -326,7 +326,7 @@ class MyImitator(nn.Module):
         # self.embeddings = nn.Linear(config.num_classes, config.continuous_params_size, bias=False)
 
         ch = self.conf.channel_width
-        condition_vector_dim = 223
+        condition_vector_dim = 205
 
         self.gen_z = snlinear(in_features=condition_vector_dim, out_features=4*4*16*ch, eps=self.conf.eps)
         layers = []

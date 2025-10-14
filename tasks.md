@@ -1,10 +1,8 @@
 # Face2Parameter Training Tasks
 
-- [ ] Confirm the continuous parameter dimensionality by sampling several entries in the new `param.json` and counting elements (log the chosen value for later configs, ≈10 min).
-- [ ] Investigate the 108 203 param keys that did not match images during split generation and reconcile naming or path issues so the full 70 512 samples become usable (≈20 min).
 - [x] Produce reproducible train/val splits from the 70 512 images—write a helper (or script) that shuffles keys and writes two index files, instead of physically copying images (≈15 min). *(Completed: `tools/create_data_split.py`, current subset 20 952 train / 5 239 val).*
 - [x] Refactor `dataset.Imitator_Dataset` to read from the new key/index files rather than numeric filenames, and make it accept the split lists created above (≈15 min). *(Completed: `train_myimitator.py` now loads JSON indices and resizes to 512².)*
-- [ ] Update `config.py`, `train_myimitator.py`, and any other scripts with hard-coded Windows paths so they reference the local `images/` directory and `param.json` (≈10 min).
+- [x] Update `config.py`, `train_myimitator.py`, and any other scripts with hard-coded Windows paths so they reference the local `images/` directory and `param.json` (≈10 min).
 - [x] Create or verify runtime folders (`./logs/`, `./output/preview/`, `./output/imitator/`) so checkpoints and previews can be written without errors (≈5 min). *(Handled programmatically when training starts.)*
 - [ ] Extend `requirements.txt` with missing dependencies you’ll install (`opencv-python`, `dlib`, `tqdm`, etc.) and run `pip install -r requirements.txt` in the environment (≈10 min).
 - [ ] Gather the required pretrained assets into `./checkpoint/` (`LightCNN_29Layers_V2_checkpoint.pth.tar`, `shape_predictor_68_face_landmarks.dat`, `resnet18-5c106cde.pth`, latest imitator weights) or update configs to point at available weights (≈15 min).
