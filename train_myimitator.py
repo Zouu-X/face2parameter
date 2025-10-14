@@ -22,6 +22,9 @@ import time
 import copy
 import math
 
+import mlflow
+import mlflow.pytorch
+
 '''
     在服务器上训练只需上传这一个文件即可
 '''
@@ -114,6 +117,26 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset is not None else None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+active_run = mlflow.active_run()
+if active_run is None:
+    mlflow.start_run()
+
+mlflow.log_params({
+    "batch_size": batch_size,
+    "num_epochs": num_epochs,
+    "learning_rate": 5e-5,
+    "train_size": len(train_dataset),
+    "val_size": len(val_dataset) if val_dataset is not None else 0,
+    "image_resolution": 512,
+    "condition_vector_dim": 223,
+})
+
+# Keep track of best model for MLflow logging
+best_metric = float("inf")
+best_state_dict = None
+best_epoch = -1
+metric_name = "val_loss" if val_dataloader is not None else "train_loss"
 
 
 # real_batch = next(iter(val_dataloader))
@@ -435,6 +458,7 @@ train_loss_list = []
 val_loss_list = []
 for epoch in range(num_epochs):
     start = time.time()
+    running_loss = 0.0
     for i, (params, img) in enumerate(train_dataloader):
         optimizer.zero_grad()
         params = params.to(device)
@@ -444,12 +468,18 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
+        running_loss += loss.item()
+        global_step = epoch * total_step + i
+        mlflow.log_metric("train_loss_step", loss.item(), step=global_step)
+
         if (i % 10) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), time.time() - start))
             start = time.time()
 
-    train_loss_list.append(loss.item())
+    avg_train_loss = running_loss / total_step
+    train_loss_list.append(avg_train_loss)
+    mlflow.log_metric("train_loss_epoch", avg_train_loss, step=epoch)
     if val_dataloader is not None:
         imitator.eval()
         with torch.no_grad():
@@ -464,7 +494,9 @@ for epoch in range(num_epochs):
                     vutils.save_image(
                         vutils.make_grid(outputs.to(device)[:16], nrow=4, padding=2, normalize=True).cpu(),
                         os.path.join(preview_dir, f"{epoch}.jpg"))
-            val_loss_list.append(val_loss / len(val_dataloader))
+            val_loss_avg = val_loss / len(val_dataloader)
+            val_loss_list.append(val_loss_avg)
+            mlflow.log_metric("val_loss_epoch", val_loss_avg, step=epoch)
 
             print('Epoch [{}/{}], val_loss: {:.6f}'
                   .format(epoch + 1, num_epochs, val_loss))
@@ -481,9 +513,31 @@ for epoch in range(num_epochs):
                 plt.savefig(metrics_path)
                 plt.close("all")
 
+            current_metric = val_loss_avg
         imitator.train()
     else:
+        current_metric = avg_train_loss
         if (epoch % 10) == 0 or (epoch + 1) == num_epochs:
             torch.save(imitator.state_dict(),
                        os.path.join(model_dir, 'epoch_{}_train_loss_{:.6f}_file.pt'.format(
-                           epoch, loss.item())))
+                           epoch, avg_train_loss)))
+
+    if current_metric < best_metric:
+        best_metric = current_metric
+        best_epoch = epoch
+        model_ref = imitator.module if isinstance(imitator, nn.DataParallel) else imitator
+        best_state_dict = copy.deepcopy(model_ref.state_dict())
+        mlflow.log_metric("best_loss", best_metric, step=epoch)
+        mlflow.log_metric("best_epoch", best_epoch, step=epoch)
+
+model_to_log = imitator.module if isinstance(imitator, nn.DataParallel) else imitator
+if best_state_dict is not None:
+    original_state = copy.deepcopy(model_to_log.state_dict())
+    model_to_log.load_state_dict(best_state_dict)
+    mlflow.pytorch.log_model(model_to_log, artifact_path="models/best")
+    model_to_log.load_state_dict(original_state)
+else:
+    mlflow.pytorch.log_model(model_to_log, artifact_path="models/final")
+
+if active_run is None:
+    mlflow.end_run()
