@@ -10,6 +10,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
 from torchvision import transforms as T
+from torchvision.transforms import InterpolationMode
 from torch.utils.data import DataLoader, Dataset
 import json
 import torchvision.utils as vutils
@@ -66,10 +67,16 @@ def _load_split(index_file):
     return samples
 
 
+DEFAULT_IMG_TRANSFORM = T.Compose([
+    T.Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
+    T.ToTensor(),
+])
+
+
 class Imitator_Dataset(Dataset):
     def __init__(self, params_root, image_root, index_file, transform=None):
         self.image_root = image_root
-        self.transform = transform or T.ToTensor()
+        self.transform = transform or DEFAULT_IMG_TRANSFORM
         with open(params_root, encoding='utf-8') as f:
             self.params = json.load(f)
         self.samples = _load_split(index_file)
@@ -92,9 +99,9 @@ class Imitator_Dataset(Dataset):
         return len(self.samples)
 
 
-train_dataset = Imitator_Dataset(params_path, images_root, train_index_file, transform=T.ToTensor())
+train_dataset = Imitator_Dataset(params_path, images_root, train_index_file)
 if os.path.exists(val_index_file):
-    val_dataset = Imitator_Dataset(params_path, images_root, val_index_file, transform=T.ToTensor())
+    val_dataset = Imitator_Dataset(params_path, images_root, val_index_file)
 else:
     val_dataset = None
 
