@@ -347,7 +347,7 @@ class MyImitator(nn.Module):
 
         self.bn = BigGANBatchNorm(ch, n_stats=self.conf.n_stats, eps=self.conf.eps, conditional=False)
         self.relu = nn.ReLU()
-        self.conv_to_rgb = snconv2d(in_channels=ch, out_channels=ch, kernel_size=3, padding=1, eps=self.conf.eps)
+        self.conv_to_rgb = snconv2d(in_channels=ch, out_channels=3, kernel_size=3, padding=1, eps=self.conf.eps)
         self.tanh = nn.Tanh()
 
     def forward(self, cond_vector, truncation=0.4):
@@ -369,7 +369,7 @@ class MyImitator(nn.Module):
         z = self.bn(z, truncation)    # [1, 128, 512, 512]
         z = self.relu(z)    # [1, 128, 512, 512]
         z = self.conv_to_rgb(z)    # [1, 128, 512, 512]
-        z = z[:, :3, ...]    # [1, 3, 512, 512]
+        # z = z[:, :3, ...]    # [1, 3, 512, 512]
         z = self.tanh(z)    # [1, 3, 512, 512]
         return z
 
