@@ -117,8 +117,26 @@ model_dir = os.path.join(dataset_root, "model")
 metrics_path = os.path.join(dataset_root, "metrics.jpg")
 os.makedirs(preview_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset is not None else None
+# train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+# val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset is not None else None
+num_workers = 4  # or higher if the cluster allows
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=num_workers,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+val_dataloader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True,
+) if val_dataset is not None else None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 use_amp = device.type == 'cuda'
@@ -431,7 +449,7 @@ imitator.to(device)
 criterion = nn.L1Loss()
 
 # optimizer = optim.SGD(imitator.parameters(), lr=lr, momentum=0.9)
-optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5,
+optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5, 
                            betas=(0.0, 0.999), weight_decay=0,
                            eps=1e-8)
 
