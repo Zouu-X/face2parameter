@@ -158,20 +158,23 @@ scaler = GradScaler(enabled=use_amp)
 
 '''
     自定义Imitator
-    1.conv，linear，embedding后加上sn
+    1.conv，linear，embedding使用标准层
     2.指定层加上self-attention
     3.自定义bn
 '''
 
-# 采用sn做 normalization
+# 标准卷积/线性层实现，去除原 spectral normalization
 def snconv2d(eps=1e-12, **kwargs):
-    return nn.utils.spectral_norm(nn.Conv2d(**kwargs), eps=eps)
+    _ = eps  # keep signature compatibility
+    return nn.Conv2d(**kwargs)
 
 def snlinear(eps=1e-12, **kwargs):
-    return nn.utils.spectral_norm(nn.Linear(**kwargs), eps=eps)
+    _ = eps
+    return nn.Linear(**kwargs)
 
 def sn_embedding(eps=1e-12, **kwargs):
-    return nn.utils.spectral_norm(nn.Embedding(**kwargs), eps=eps)
+    _ = eps
+    return nn.Embedding(**kwargs)
 
 # self-attention层
 class SelfAttn(nn.Module):
