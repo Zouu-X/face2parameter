@@ -41,9 +41,9 @@ random.seed(manualSeed)
 torch.manual_seed(manualSeed)
 
 # Batch size during training
-batch_size = 8
-image_size = 512
-num_epochs = 50
+batch_size = 16
+# image_size = 512
+num_epochs = 10
 lr = 0.01
 ngpu = 2
 print("start loading root")
@@ -73,17 +73,21 @@ def _load_split(index_file):
         raise ValueError(f"No valid entries found in split file: {index_file}")
     return samples
 
-
+### 将图像从256转512
+# DEFAULT_IMG_TRANSFORM = T.Compose([
+#     T.Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
+#     T.ToTensor(),
+# ])
 DEFAULT_IMG_TRANSFORM = T.Compose([
-    T.Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
     T.ToTensor(),
+    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 再映射到 [-1,1]
 ])
-
 
 class Imitator_Dataset(Dataset):
     def __init__(self, params_root, image_root, index_file, transform=None):
         self.image_root = image_root
         self.transform = transform or DEFAULT_IMG_TRANSFORM
+        # self.transform = transform or T.ToTensor()
         with open(params_root, encoding='utf-8') as f:
             self.params = json.load(f)
         self.samples = _load_split(index_file)
@@ -105,7 +109,6 @@ class Imitator_Dataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-print("start loading dataset")
 train_dataset = Imitator_Dataset(params_path, images_root, train_index_file)
 if os.path.exists(val_index_file):
     val_dataset = Imitator_Dataset(params_path, images_root, val_index_file)
@@ -320,7 +323,7 @@ class MyImitator(nn.Module):
         super(MyImitator, self).__init__()
 
         # 1.加载配置文件
-        with open("/Workspace/Users/xiangxzou@global.tencent.com/face2parameter/checkpoint/myimitator-512.json", "r", encoding='utf-8') as reader:
+        with open("/Workspace/Users/xiangxzou@global.tencent.com/face2parameter/checkpoint/myimitator-256.json", "r", encoding='utf-8') as reader:
             text = reader.read()
         self.conf = BigGANConfig()
         for key, value in json.loads(text).items():
@@ -474,12 +477,15 @@ for epoch in range(num_epochs):
         scaler.step(optimizer)
         scaler.update()
 
-        if (i % 10) == 0:
+        if (i %100) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss_value, time.time() - start))
             start = time.time()
 
     train_loss_list.append(loss_value)
+
+
+
     if val_dataloader is not None:
         imitator.eval()
         with torch.no_grad():
@@ -495,7 +501,8 @@ for epoch in range(num_epochs):
                     vutils.save_image(
                         vutils.make_grid(outputs.to(device)[:16], nrow=4, padding=2, normalize=True).cpu(),
                         os.path.join(preview_dir, f"{epoch}.jpg"))
-            val_loss_list.append(val_loss / len(val_dataloader))
+            val_loss = val_loss / len(val_dataloader)
+            val_loss_list.append(val_loss)
 
             print('Epoch [{}/{}], val_loss: {:.6f}'
                   .format(epoch + 1, num_epochs, val_loss))
