@@ -35,40 +35,97 @@ torch.manual_seed(manualSeed)
 # Batch size during training
 batch_size = 16
 image_size = 512
-num_epochs = 1000
+num_epochs = 30
 lr = 0.01
 ngpu = 2
 
-image_root = "F:/dataset/face_20211203_20000_nojiemao/"
+dataset_root = "/db-mnt/mnt/efs-mount/home/xiangxzou/"
+params_path = os.path.join(dataset_root, "labels.json")
+images_root = os.path.join(dataset_root, "images")
+splits_root = os.path.join(dataset_root, "splits")
+train_index_file = os.path.join(splits_root, "train.json")
+val_index_file = os.path.join(splits_root, "val.json")
+
+
+def _load_split(index_file):
+    with open(index_file, encoding="utf-8") as f:
+        records = json.load(f)
+    samples = []
+    for item in records:
+        if isinstance(item, dict):
+            key = item.get("key")
+            rel_path = item.get("path") or item.get("image") or ""
+        else:
+            rel_path = str(item)
+            key = os.path.splitext(os.path.basename(rel_path))[0]
+        if not key or not rel_path:
+            continue
+        samples.append((key, rel_path))
+    if not samples:
+        raise ValueError(f"No valid entries found in split file: {index_file}")
+    return samples
+
+DEFAULT_IMG_TRANSFORM = T.Compose([
+    T.ToTensor(),
+    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 再映射到 [-1,1]
+])
 
 class Imitator_Dataset(Dataset):
-    def __init__(self, params_root, image_root, mode="train"):
+    def __init__(self, params_root, image_root, index_file, transform=None):
         self.image_root = image_root
-        self.mode = mode
+        self.transform = transform or DEFAULT_IMG_TRANSFORM
+        # self.transform = transform or T.ToTensor()
         with open(params_root, encoding='utf-8') as f:
             self.params = json.load(f)
+        self.samples = _load_split(index_file)
+        self.missing_keys = [key for key, _ in self.samples if key not in self.params]
+        if self.missing_keys:
+            print(f"WARNING: {len(self.missing_keys)} split entries missing params. They will be skipped.")
+            self.samples = [(key, path) for key, path in self.samples if key in self.params]
+        if not self.samples:
+            raise ValueError("No samples available after filtering missing parameter entries.")
 
     def __getitem__(self, index):
-        if self.mode == "val":
-            img = Image.open(os.path.join(self.image_root, '%d.png' % (index + 18000))).convert("RGB")
-            param = torch.tensor(self.params['%d.png' % (index + 18000)])
-        else:
-            img = Image.open(os.path.join(self.image_root, '%d.png' % index)).convert("RGB")
-            param = torch.tensor(self.params['%d.png' % index])
-        img = T.ToTensor()(img)
+        key, rel_path = self.samples[index]
+        img_path = os.path.join(self.image_root, rel_path)
+        img = Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+        param = torch.tensor(self.params[key], dtype=torch.float32)
         return param, img
 
     def __len__(self):
-        if self.mode == "train":
-            return 18000
-        else:
-            return 2000
+        return len(self.samples)
 
+train_dataset = Imitator_Dataset(params_path, images_root, train_index_file)
+if os.path.exists(val_index_file):
+    val_dataset = Imitator_Dataset(params_path, images_root, val_index_file)
+else:
+    val_dataset = None
 
-train_dataset = Imitator_Dataset(image_root + "param.json", image_root + "face_train/", mode="train")
-val_dataset = Imitator_Dataset(image_root + "param.json", image_root + "face_val/", mode="val")
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+val_dataloader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True,
+) if val_dataset is not None else None
+
+preview_dir = os.path.join(dataset_root, "gen_image")
+model_dir = os.path.join(dataset_root, "model")
+metrics_path = os.path.join(dataset_root, "metrics.jpg")
+os.makedirs(preview_dir, exist_ok=True)
+os.makedirs(model_dir, exist_ok=True)
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -250,7 +307,7 @@ class MyImitator(nn.Module):
         super(MyImitator, self).__init__()
 
         # 1.加载配置文件
-        with open("./checkpoint/myimitator-512.json", "r", encoding='utf-8') as reader:
+        with open("/Workspace/Users/xiangxzou@global.tencent.com/face2parameter/checkpoint/myimitator-256.json", "r", encoding='utf-8') as reader:
             text = reader.read()
         self.conf = BigGANConfig()
         for key, value in json.loads(text).items():
@@ -260,7 +317,7 @@ class MyImitator(nn.Module):
         # self.embeddings = nn.Linear(config.num_classes, config.continuous_params_size, bias=False)
 
         ch = self.conf.channel_width
-        condition_vector_dim = 223
+        condition_vector_dim = 205
 
         self.gen_z = snlinear(in_features=condition_vector_dim, out_features=4*4*16*ch, eps=self.conf.eps)
         layers = []
@@ -401,7 +458,7 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-        if (i % 10) == 0:
+        if (i % 100) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), time.time() - start))
             start = time.time()
@@ -416,25 +473,27 @@ for epoch in range(num_epochs):
             outputs = imitator(params)
             loss = criterion(outputs, img)
             val_loss += loss.item()
+
             if i == 1:
                 vutils.save_image(
                     vutils.make_grid(outputs.to(device)[:16], nrow=4, padding=2, normalize=True).cpu(),
-                    image_root + "gen_image/%d.jpg" % epoch)
-        val_loss_list.append(val_loss / len(val_dataloader))
+                    os.path.join(preview_dir, f"{epoch}.jpg"))
+        val_loss = val_loss / len(val_dataloader)
+        val_loss_list.append(val_loss)
 
         print('Epoch [{}/{}], val_loss: {:.6f}'
               .format(epoch + 1, num_epochs, val_loss))
         if (epoch % 10) == 0 or (epoch+1) == num_epochs:
             torch.save(imitator.state_dict(),
-                       image_root + 'model/epoch_{}_val_loss_{:.6f}_file.pt'.format(
-                           epoch, val_loss))
+                       os.path.join(model_dir, 'epoch_{}_val_loss_{:.6f}_file.pt'.format(
+                           epoch, val_loss)))
         if epoch >= 1:
             plt.figure()
             plt.subplot(121)
             plt.plot(np.arange(0, len(train_loss_list)), train_loss_list)
             plt.subplot(122)
             plt.plot(np.arange(0, len(val_loss_list)), val_loss_list)
-            plt.savefig(image_root + "metrics.jpg")
+            plt.savefig(metrics_path)
             plt.close("all")
 
     imitator.train()
