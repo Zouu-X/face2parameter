@@ -43,7 +43,7 @@ torch.manual_seed(manualSeed)
 # Batch size during training
 batch_size = 16
 # image_size = 512
-num_epochs = 10
+num_epochs = 30
 lr = 0.01
 ngpu = 2
 print("start loading root")
@@ -210,7 +210,7 @@ class SelfAttn(nn.Module):
         attn_g = torch.bmm(g, attn.permute(0, 2, 1))
         attn_g = attn_g.view(-1, ch//2, h, w)
         attn_g = self.snconv1x1_o_conv(attn_g)
-        # Out
+        # Outs
         out = x + self.gamma*attn_g
         return out
 
@@ -229,41 +229,33 @@ class BigGANBatchNorm(nn.Module):
         self.eps = eps
         self.conditional = conditional
 
-        # We use pre-computed statistics for n_stats values of truncation between 0 and 1
-        self.register_buffer('running_means', torch.zeros(n_stats, num_features))
-        self.register_buffer('running_vars', torch.ones(n_stats, num_features))
-        self.step_size = 1.0 / (n_stats - 1)
+        self.bn = nn.BatchNorm2d(num_features, eps=eps, affine=False)
 
         if conditional:
             assert condition_vector_dim is not None
-            self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
-            self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
+            # self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
+            # self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
+            self.scale = nn.Linear(condition_vector_dim, num_features, bias=False)
+            self.offset = nn.Linear(condition_vector_dim, num_features, bias=False)
+            nn.init.zeros_(self.scale.weight)
+            nn.init.zeros_(self.offset.weight)
         else:
             self.weight = torch.nn.Parameter(torch.Tensor(num_features))
             self.bias = torch.nn.Parameter(torch.Tensor(num_features))
 
-    def forward(self, x, truncation, condition_vector=None):
-        # Retreive pre-computed statistics associated to this truncation
-        coef, start_idx = math.modf(truncation / self.step_size)
-        start_idx = int(start_idx)
-        if coef != 0.0:  # Interpolate
-            running_mean = self.running_means[start_idx] * coef + self.running_means[start_idx + 1] * (1 - coef)
-            running_var = self.running_vars[start_idx] * coef + self.running_vars[start_idx + 1] * (1 - coef)
-        else:
-            running_mean = self.running_means[start_idx]
-            running_var = self.running_vars[start_idx]
+    def forward(self, x, condition_vector=None):
+        out = self.bn(x)
 
         if self.conditional:
-            running_mean = running_mean.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            running_var = running_var.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-
+            assert condition_vector is not None
             weight = 1 + self.scale(condition_vector).unsqueeze(-1).unsqueeze(-1)
             bias = self.offset(condition_vector).unsqueeze(-1).unsqueeze(-1)
 
-            out = (x - running_mean) / torch.sqrt(running_var + self.eps) * weight + bias
+            out = out * weight + bias
         else:
-            out = F.batch_norm(x, running_mean, running_var, self.weight, self.bias,
-                               training=False, momentum=0.0, eps=self.eps)
+            out = self.bn(x)
+            if hasattr(self, "weight"):
+                out = out * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
         return out
 
 class GenBlock(nn.Module):
@@ -288,24 +280,24 @@ class GenBlock(nn.Module):
 
         self.relu = nn.ReLU()
 
-    def forward(self, x, cond_vector, truncation):
+    def forward(self, x, cond_vector):
         x0 = x
 
-        x = self.bn_0(x, truncation, cond_vector)
+        x = self.bn_0(x, cond_vector)
         x = self.relu(x)
         x = self.conv_0(x)
 
-        x = self.bn_1(x, truncation, cond_vector)
+        x = self.bn_1(x, cond_vector)
         x = self.relu(x)
         if self.up_sample:
             x = F.interpolate(x, scale_factor=2, mode='nearest')
         x = self.conv_1(x)
 
-        x = self.bn_2(x, truncation, cond_vector)
+        x = self.bn_2(x, cond_vector)
         x = self.relu(x)
         x = self.conv_2(x)
 
-        x = self.bn_3(x, truncation, cond_vector)
+        x = self.bn_3(x, cond_vector)
         x = self.relu(x)
         x = self.conv_3(x)
 
@@ -350,10 +342,11 @@ class MyImitator(nn.Module):
 
         self.bn = BigGANBatchNorm(ch, n_stats=self.conf.n_stats, eps=self.conf.eps, conditional=False)
         self.relu = nn.ReLU()
-        self.conv_to_rgb = snconv2d(in_channels=ch, out_channels=3, kernel_size=3, padding=1, eps=self.conf.eps)
+        with torch.cuda.amp.autocast(enabled=False):
+            self.conv_to_rgb = snconv2d(in_channels=ch, out_channels=3, kernel_size=3, padding=1, eps=self.conf.eps)
         self.tanh = nn.Tanh()
 
-    def forward(self, cond_vector, truncation=0.4):
+    def forward(self, cond_vector):
         # cond_vector = cond_vector.unsqueeze(2).unsqueeze(3)
         z = self.gen_z(cond_vector)    # cond_cector [batch_size, config.continuous_params_size], z [1, 4*4*16*self.conf.channel_width]
 
@@ -365,12 +358,13 @@ class MyImitator(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if isinstance(layer, GenBlock):
-                z = layer(z, cond_vector, truncation)
+                z = layer(z, cond_vector)
             else:
                 z = layer(z)
 
-        z = self.bn(z, truncation)    # [1, 128, 512, 512]
+        z = self.bn(z)    # [1, 128, 512, 512]
         z = self.relu(z)    # [1, 128, 512, 512]
+        
         z = self.conv_to_rgb(z)    # [1, 128, 512, 512]
         # z = z[:, :3, ...]    # [1, 3, 512, 512]
         z = self.tanh(z)    # [1, 3, 512, 512]
@@ -442,15 +436,36 @@ class BigGANConfig(object):
         """Serializes this instance to a JSON string."""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+def catch_first_nonfinite(model):
+    flag = {"hit": False}
+    def hook(name):
+        def _fn(m, inp, out):
+            if flag["hit"]:
+                return
+            t = out if torch.is_tensor(out) else out[0]
+            if not torch.isfinite(t).all():
+                finite = torch.isfinite(t)
+                n_bad = (~finite).sum().item()
+                mean_finite = t[finite].mean().item() if finite.any() else float('nan')
+                print(f"[-----NONFINITE---------] at {name} | bad={n_bad} | finite_mean={mean_finite:.4f}")
+                flag["hit"] = True
+        return _fn
+    for n, m in model.named_modules():
+        if isinstance(m, (nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.LeakyReLU, nn.Linear, BigGANBatchNorm)):
+            m.register_forward_hook(hook(n))
+
+
+
+
 
 imitator = MyImitator()
 if device.type == 'cuda':
     imitator = nn.DataParallel(imitator)
 imitator.to(device)
-
 # Initialize BCELoss function
 criterion = nn.L1Loss()
-
+# 训练前调用一次
+catch_first_nonfinite(imitator)
 # optimizer = optim.SGD(imitator.parameters(), lr=lr, momentum=0.9)
 optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5, 
                            betas=(0.0, 0.999), weight_decay=0,
@@ -465,13 +480,30 @@ train_loss_list = []
 val_loss_list = []
 for epoch in range(num_epochs):
     start = time.time()
+    
+
     for i, (params, img) in enumerate(train_dataloader):
         optimizer.zero_grad()
         params = params.to(device)
         img = img.to(device)
+
         with autocast(enabled=use_amp):
             outputs = imitator(params)
             loss = criterion(outputs, img)
+
+
+        if i == 0:
+            for name, m in imitator.named_modules():
+                if isinstance(m, BigGANBatchNorm):
+                    bn = getattr(m, "bn", None)
+                    if bn is None:
+                        print(f"[WARN] {name} 没有 self.bn（Scheme C 可能没生效）")
+                        continue
+                    print(f"[CHK] {name} | training={bn.training} "
+                          f"| track={bn.track_running_stats} | mom={bn.momentum} "
+                          f"| mean≈{bn.running_mean.abs().mean().item():.4f} "
+                          f"| var≈{bn.running_var.mean().item():.4f}")
+
         loss_value = loss.item()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
