@@ -21,6 +21,9 @@ import time
 import copy
 import math
 
+from torch.cuda.amp import autocast, GradScaler
+
+
 '''
     在服务器上训练只需上传这一个文件即可
 '''
@@ -33,7 +36,7 @@ random.seed(manualSeed)
 torch.manual_seed(manualSeed)
 
 # Batch size during training
-batch_size = 16
+batch_size = 8
 image_size = 512
 num_epochs = 30
 lr = 0.01
@@ -482,6 +485,10 @@ optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5,
                            betas=(0.0, 0.999), weight_decay=0,
                            eps=1e-8)
 
+
+use_amp = (device.type == 'cuda')
+scaler = GradScaler(enabled=use_amp)
+
 # 每50个epoch衰减10%
 # scheduler = lr_scheduler.StepLR(optimizer, step_size=len(train_dataloader) * 50, gamma=0.9)
 
@@ -495,10 +502,12 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         params = params.to(device)
         img = img.to(device)
-        outputs = imitator(params)
-        loss = criterion(outputs, img)
-        loss.backward()
-        optimizer.step()
+        with autocast(enabled=use_amp):
+            outputs = imitator(params)
+            loss = criterion(outputs, img)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         if (i % 100) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
@@ -512,8 +521,9 @@ for epoch in range(num_epochs):
         for i, (params, img) in enumerate(val_dataloader):
             params = params.to(device)
             img = img.to(device)
-            outputs = imitator(params)
-            loss = criterion(outputs, img)
+            with autocast(enabled=use_amp):
+                outputs = imitator(params)
+                loss = criterion(outputs, img)
             val_loss += loss.item()
 
             if i == 1:
