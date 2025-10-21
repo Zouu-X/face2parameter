@@ -141,56 +141,36 @@ class SelfAttn(nn.Module):
         out = x + self.gamma*attn_g
         return out
 
-# 自定义bn
+# 自定义bn（基于 ConditionalBatchNorm2d 结构）
 class BigGANBatchNorm(nn.Module):
-    """ This is a batch norm module that can handle conditional input and can be provided with pre-computed
-        activation means and variances for various truncation parameters.
+    """Conditional BatchNorm for generator.
 
-        We cannot just rely on torch.batch_norm since it cannot handle
-        batched weights (pytorch 1.0.1). We computate batch_norm our-self without updating running means and variances.
-        If you want to train this model you should add running means and variance computation logic.
+    简化为：
+    - 条件分支：`BN(affine=False)` + 线性层生成逐样本 `gamma/beta`，输出为 `BN(x) * (1 + gamma) + beta`。
+    - 非条件分支：普通 `BN(affine=True)`。
+
+    注：保持与现有调用一致，`truncation` 参数被忽略（固定 0.4）。
     """
     def __init__(self, num_features, condition_vector_dim=None, n_stats=51, eps=1e-4, conditional=True):
         super(BigGANBatchNorm, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
         self.conditional = conditional
-
-        # We use pre-computed statistics for n_stats values of truncation between 0 and 1
-        self.register_buffer('running_means', torch.zeros(n_stats, num_features))
-        self.register_buffer('running_vars', torch.ones(n_stats, num_features))
-        self.step_size = 1.0 / (n_stats - 1)
 
         if conditional:
             assert condition_vector_dim is not None
-            self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
-            self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
+            self.bn = nn.BatchNorm2d(num_features, affine=False, eps=eps)
+            # 使用光谱归一化的线性层以稳定训练
+            self.gamma = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=True, eps=eps)
+            self.beta = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=True, eps=eps)
         else:
-            self.weight = torch.nn.Parameter(torch.Tensor(num_features))
-            self.bias = torch.nn.Parameter(torch.Tensor(num_features))
+            self.bn = nn.BatchNorm2d(num_features, affine=True, eps=eps)
 
     def forward(self, x, truncation, condition_vector=None):
-        # Retreive pre-computed statistics associated to this truncation
-        coef, start_idx = math.modf(truncation / self.step_size)
-        start_idx = int(start_idx)
-        if coef != 0.0:  # Interpolate
-            running_mean = self.running_means[start_idx] * coef + self.running_means[start_idx + 1] * (1 - coef)
-            running_var = self.running_vars[start_idx] * coef + self.running_vars[start_idx + 1] * (1 - coef)
-        else:
-            running_mean = self.running_means[start_idx]
-            running_var = self.running_vars[start_idx]
-
+        out = self.bn(x)
         if self.conditional:
-            running_mean = running_mean.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            running_var = running_var.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-
-            weight = 1 + self.scale(condition_vector).unsqueeze(-1).unsqueeze(-1)
-            bias = self.offset(condition_vector).unsqueeze(-1).unsqueeze(-1)
-
-            out = (x - running_mean) / torch.sqrt(running_var + self.eps) * weight + bias
-        else:
-            out = F.batch_norm(x, running_mean, running_var, self.weight, self.bias,
-                               training=False, momentum=0.0, eps=self.eps)
+            # 逐样本仿射：gamma 中心化为 1
+            gamma = self.gamma(condition_vector).unsqueeze(-1).unsqueeze(-1)
+            beta = self.beta(condition_vector).unsqueeze(-1).unsqueeze(-1)
+            out = out * (1 + gamma) + beta
         return out
 
 class GenBlock(nn.Module):
