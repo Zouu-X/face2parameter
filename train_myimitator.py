@@ -353,11 +353,11 @@ class MyImitator(nn.Module):
             else:
                 z = layer(z)
 
-        z = self.bn(z, truncation)    # [1, 128, 512, 512]
-        z = self.relu(z)    # [1, 128, 512, 512]
-        z = self.conv_to_rgb(z)    # [1, 128, 512, 512]
-        z = z[:, :3, ...]    # [1, 3, 512, 512]
-        z = self.tanh(z)    # [1, 3, 512, 512]
+        z = self.bn(z, truncation)    # [1, 128, 256, 256]
+        z = self.relu(z)    # [1, 128, 256, 256]
+        z = self.conv_to_rgb(z)    # [1, 128, 256, 256]
+        z = z[:, :3, ...]    # [1, 3, 256, 256]
+        z = self.tanh(z)    # [1, 3, 256, 256]
         return z
 
 '''
