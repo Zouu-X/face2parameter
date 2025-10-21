@@ -203,15 +203,18 @@ class BigGANBatchNorm(nn.Module):
     """ This is a batch norm module that can handle conditional input and can be provided with pre-computed
         activation means and variances for various truncation parameters.
 
-        We cannot just rely on torch.batch_norm since it cannot handle
-        batched weights (pytorch 1.0.1). We computate batch_norm our-self without updating running means and variances.
-        If you want to train this model you should add running means and variance computation logic.
+        During training we compute per-channel batch statistics and update
+        per-truncation running statistics with momentum. At eval time we use the
+        (optionally interpolated) running statistics for the given truncation.
     """
-    def __init__(self, num_features, condition_vector_dim=None, n_stats=51, eps=1e-4, conditional=True):
+    def __init__(self, num_features, condition_vector_dim=None, n_stats=51, eps=1e-4, conditional=True,
+                 momentum=0.1, track_running_stats=True):
         super(BigGANBatchNorm, self).__init__()
         self.num_features = num_features
         self.eps = eps
         self.conditional = conditional
+        self.momentum = momentum
+        self.track_running_stats = track_running_stats
 
         # We use pre-computed statistics for n_stats values of truncation between 0 and 1
         self.register_buffer('running_means', torch.zeros(n_stats, num_features))
@@ -223,31 +226,70 @@ class BigGANBatchNorm(nn.Module):
             self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
             self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
         else:
-            self.weight = torch.nn.Parameter(torch.Tensor(num_features))
-            self.bias = torch.nn.Parameter(torch.Tensor(num_features))
+            # Match BatchNorm defaults: weight=1, bias=0
+            self.weight = torch.nn.Parameter(torch.ones(num_features))
+            self.bias = torch.nn.Parameter(torch.zeros(num_features))
+
+    def _truncation_indices(self, truncation):
+        """Return indices and interpolation weights for the truncation binning.
+        Ensures clamping to [0, 1] and safe end indexing.
+        """
+        t = float(truncation)
+        t = max(0.0, min(1.0, t))
+        n = self.running_means.size(0)
+        scaled = t * (n - 1)
+        idx0 = int(math.floor(scaled))
+        idx1 = min(idx0 + 1, n - 1)
+        alpha = scaled - idx0  # in [0,1]
+        w0 = 1.0 - alpha
+        w1 = alpha
+        return idx0, idx1, w0, w1
 
     def forward(self, x, truncation, condition_vector=None):
-        # Retreive pre-computed statistics associated to this truncation
-        coef, start_idx = math.modf(truncation / self.step_size)
-        start_idx = int(start_idx)
-        if coef != 0.0:  # Interpolate
-            running_mean = self.running_means[start_idx] * coef + self.running_means[start_idx + 1] * (1 - coef)
-            running_var = self.running_vars[start_idx] * coef + self.running_vars[start_idx + 1] * (1 - coef)
-        else:
-            running_mean = self.running_means[start_idx]
-            running_var = self.running_vars[start_idx]
+        # Compute interpolation indices/weights for this truncation value
+        idx0, idx1, w0, w1 = self._truncation_indices(truncation)
 
+        if self.training:
+            # Per-channel batch statistics over N,H,W
+            batch_mean = x.mean(dim=(0, 2, 3))
+            batch_var = x.var(dim=(0, 2, 3), unbiased=False)
+
+            # Optionally update running stats for neighboring truncation bins
+            if self.track_running_stats:
+                with torch.no_grad():
+                    m = self.momentum
+                    # update idx0 weighted by w0
+                    if w0 > 0:
+                        self.running_means[idx0].mul_(1 - m * w0).add_(batch_mean * (m * w0))
+                        self.running_vars[idx0].mul_(1 - m * w0).add_(batch_var * (m * w0))
+                    # update idx1 weighted by w1 (only if different or w1>0)
+                    if (idx1 != idx0) and (w1 > 0):
+                        self.running_means[idx1].mul_(1 - m * w1).add_(batch_mean * (m * w1))
+                        self.running_vars[idx1].mul_(1 - m * w1).add_(batch_var * (m * w1))
+
+            mean = batch_mean
+            var = batch_var
+        else:
+            # Interpolated running statistics for inference/eval
+            mean = self.running_means[idx0] * w0 + self.running_means[idx1] * w1
+            var = self.running_vars[idx0] * w0 + self.running_vars[idx1] * w1
+
+        # Normalize and apply affine/conditional parameters
         if self.conditional:
-            running_mean = running_mean.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            running_var = running_var.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            assert condition_vector is not None, "condition_vector must be provided for conditional BigGANBatchNorm"
+            mean_ = mean.view(1, -1, 1, 1)
+            var_ = var.view(1, -1, 1, 1)
+            out = (x - mean_) / torch.sqrt(var_ + self.eps)
 
             weight = 1 + self.scale(condition_vector).unsqueeze(-1).unsqueeze(-1)
             bias = self.offset(condition_vector).unsqueeze(-1).unsqueeze(-1)
-
-            out = (x - running_mean) / torch.sqrt(running_var + self.eps) * weight + bias
+            out = out * weight + bias
         else:
-            out = F.batch_norm(x, running_mean, running_var, self.weight, self.bias,
-                               training=False, momentum=0.0, eps=self.eps)
+            mean_ = mean.view(1, -1, 1, 1)
+            var_ = var.view(1, -1, 1, 1)
+            out = (x - mean_) / torch.sqrt(var_ + self.eps)
+            out = out * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+
         return out
 
 class GenBlock(nn.Module):
