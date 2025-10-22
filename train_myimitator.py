@@ -94,7 +94,8 @@ class Imitator_Dataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
         param = torch.tensor(self.params[key], dtype=torch.float32)
-        return param, img
+        # 返回key和相对路径，便于在训练中做匹配性检查/日志
+        return param, img, key, rel_path
 
     def __len__(self):
         return len(self.samples)
@@ -496,14 +497,40 @@ total_step = len(train_dataloader)
 imitator.train()
 train_loss_list = []
 val_loss_list = []
+def _log_sample_pairs(keys, rel_paths, params_tensor, imgs_tensor, prefix="train"):
+    try:
+        bsz = params_tensor.shape[0]
+        msg_head = f"[{prefix}] batch_size={bsz}, param_dim={list(params_tensor.shape)} img_shape={list(imgs_tensor.shape)}"
+        print(msg_head)
+        n_show = min(3, bsz)
+        for j in range(n_show):
+            base = os.path.splitext(os.path.basename(rel_paths[j]))[0]
+            print(f"  {j}: key={keys[j]} | path={rel_paths[j]} | base={base}")
+    except Exception as e:
+        print(f"[warn] logging sample pairs failed: {e}")
+
+
 for epoch in range(num_epochs):
     start = time.time()
-    for i, (params, img) in enumerate(train_dataloader):
+    for i, batch in enumerate(train_dataloader):
+        # 支持2元/4元返回，为兼容性保留
+        if isinstance(batch, (list, tuple)) and len(batch) == 4:
+            params, img, keys, rel_paths = batch
+        else:
+            params, img = batch
+            keys, rel_paths = None, None
         optimizer.zero_grad()
         params = params.to(device)
         img = img.to(device)
+        # 首批次打印样本配对信息与基本形状
+        if i == 0 and keys is not None and rel_paths is not None:
+            _log_sample_pairs(keys, rel_paths, params, img, prefix="train")
         with autocast(enabled=use_amp):
             outputs = imitator(params)
+            # 基本匹配性检查：batch维度和HW/通道是否可对齐
+            if outputs.shape != img.shape:
+                raise RuntimeError(
+                    f"Output/Image shape mismatch: outputs={list(outputs.shape)} vs img={list(img.shape)}")
             loss = criterion(outputs, img)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -518,11 +545,21 @@ for epoch in range(num_epochs):
     imitator.eval()
     with torch.no_grad():
         val_loss = 0
-        for i, (params, img) in enumerate(val_dataloader):
+        for i, batch in enumerate(val_dataloader):
+            if isinstance(batch, (list, tuple)) and len(batch) == 4:
+                params, img, keys, rel_paths = batch
+            else:
+                params, img = batch
+                keys, rel_paths = None, None
             params = params.to(device)
             img = img.to(device)
+            if i == 0 and keys is not None and rel_paths is not None:
+                _log_sample_pairs(keys, rel_paths, params, img, prefix="val")
             with autocast(enabled=use_amp):
                 outputs = imitator(params)
+                if outputs.shape != img.shape:
+                    raise RuntimeError(
+                        f"[val] Output/Image shape mismatch: outputs={list(outputs.shape)} vs img={list(img.shape)}")
                 loss = criterion(outputs, img)
             val_loss += loss.item()
 
