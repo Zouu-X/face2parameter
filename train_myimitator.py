@@ -36,8 +36,6 @@ torch.manual_seed(manualSeed)
 batch_size = 16
 image_size = 512
 num_epochs = 30
-# 是否在每个 epoch 内随机打乱 params（图像顺序保持不变）
-shuffle_params_per_epoch = True
 lr = 0.01
 ngpu = 2
 
@@ -449,30 +447,11 @@ total_step = len(train_dataloader)
 imitator.train()
 train_loss_list = []
 val_loss_list = []
-# 预先收集训练集的全部参数（用于每个 epoch 随机打乱）
-if shuffle_params_per_epoch:
-    with torch.no_grad():
-        all_params_tensor = torch.stack([
-            torch.tensor(train_dataset.params[key], dtype=torch.float32)
-            for key, _ in train_dataset.samples
-        ])  # [N, D]
-    print(f"[Param Shuffle] Collected {all_params_tensor.shape[0]} params of dim {all_params_tensor.shape[1]}")
 for epoch in range(num_epochs):
     start = time.time()
-    # 每个 epoch 打乱一次 params 顺序
-    if shuffle_params_per_epoch:
-        perm = torch.randperm(len(train_dataset))
-        shuffled_params = all_params_tensor[perm].to(device)
-        param_ptr = 0
     for i, (params, img) in enumerate(train_dataloader):
         optimizer.zero_grad()
-        # 如果启用打乱，用打乱后的 params；否则沿用 batch 自带的 params
-        if shuffle_params_per_epoch:
-            bsz = img.size(0)
-            params = shuffled_params[param_ptr:param_ptr + bsz]
-            param_ptr += bsz
-        else:
-            params = params.to(device)
+        params = params.to(device)
         img = img.to(device)
         outputs = imitator(params)
         loss = criterion(outputs, img)
