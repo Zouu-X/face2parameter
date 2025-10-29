@@ -424,13 +424,47 @@ optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5,
 use_amp = (device.type == 'cuda')
 scaler = GradScaler(enabled=use_amp)
 
-# 每50个epoch衰减10%
-# scheduler = lr_scheduler.StepLR(optimizer, step_size=len(train_dataloader) * 50, gamma=0.9)
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+    """Create a schedule with a learning rate that decreases following the
+    values of the cosine function between the initial lr set in the optimizer
+    to 0, after a warmup period during which it increases linearly from 0 to the
+    initial lr.
+
+    Args:
+        optimizer: Wrapped optimizer.
+        num_warmup_steps: Warmup steps where lr increases linearly 0 -> base_lr.
+        num_training_steps: Total number of training steps.
+        num_cycles: Cosine cycles (0.5 = single decay to zero).
+    """
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * 2.0 * num_cycles * progress)))
+
+    return lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 total_step = len(train_dataloader)
+
+# Warmup + cosine decay scheduler (per-step)
+# Use 5 warmup epochs as a reasonable default for stability
+warmup_epochs = 5
+num_training_steps = num_epochs * total_step
+num_warmup_steps = warmup_epochs * total_step
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=num_warmup_steps,
+    num_training_steps=num_training_steps,
+    num_cycles=0.5,
+)
 imitator.train()
 train_loss_list = []
 val_loss_list = []
+
+# Early stopping state
+early_stop_patience = 10
+best_val_loss = float('inf')
+epochs_no_improve = 0
 for epoch in range(num_epochs):
     start = time.time()
     for i, (params, img) in enumerate(train_dataloader):
@@ -443,10 +477,13 @@ for epoch in range(num_epochs):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        # Step LR scheduler per update
+        scheduler.step()
 
         if (i % 500) == 0:
-            print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
-                  .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), time.time() - start))
+            current_lr = optimizer.param_groups[0]['lr']
+            print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, LR: {:.6e}, spend time: {:.4f}'
+                  .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), current_lr, time.time() - start))
             start = time.time()
 
     train_loss_list.append(loss.item())
@@ -470,6 +507,14 @@ for epoch in range(num_epochs):
 
         print('Epoch [{}/{}], val_loss: {:.6f}'
               .format(epoch + 1, num_epochs, val_loss))
+
+        # Early stopping tracking and best model saving
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save(imitator.state_dict(), os.path.join(model_dir, 'best_epoch_{}_val_loss_{:.6f}.pt'.format(epoch, val_loss)))
+        else:
+            epochs_no_improve += 1
         if (epoch % 10) == 0 or (epoch+1) == num_epochs:
             torch.save(imitator.state_dict(),
                        os.path.join(model_dir, 'epoch_{}_val_loss_{:.6f}_file.pt'.format(
@@ -484,3 +529,8 @@ for epoch in range(num_epochs):
             plt.close("all")
 
     imitator.train()
+
+    # Trigger early stopping if no improvement for `early_stop_patience` epochs
+    if epochs_no_improve >= early_stop_patience:
+        print(f"Early stopping triggered after {early_stop_patience} epochs without improvement. Best val_loss: {best_val_loss:.6f}")
+        break
