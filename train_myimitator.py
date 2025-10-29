@@ -35,14 +35,14 @@ torch.manual_seed(manualSeed)
 # Batch size during training
 batch_size = 16
 image_size = 512
-num_epochs = 100
+num_epochs = 500
 lr = 0.01
 ngpu = 2
 
 dataset_root = "/db-mnt/mnt/efs-mount/home/xiangxzou/"
-params_path = os.path.join(dataset_root, "labels.json")
-images_root = os.path.join(dataset_root, "s_images")
-splits_root = os.path.join(dataset_root, "s_splits")
+params_path = os.path.join(dataset_root, "frontal_labels.json")
+images_root = os.path.join(dataset_root, "images")
+splits_root = os.path.join(dataset_root, "splits")
 train_index_file = os.path.join(splits_root, "train.json")
 val_index_file = os.path.join(splits_root, "val.json")
 
@@ -120,8 +120,8 @@ val_dataloader = DataLoader(
     persistent_workers=True,
 ) if val_dataset is not None else None
 
-preview_dir = os.path.join(dataset_root, "s_gen_image")
-model_dir = os.path.join(dataset_root, "s_model")
+preview_dir = os.path.join(dataset_root, "gen_image")
+model_dir = os.path.join(dataset_root, "model")
 metrics_path = os.path.join(dataset_root, "metrics.jpg")
 os.makedirs(preview_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
@@ -444,7 +444,7 @@ for epoch in range(num_epochs):
         scaler.step(optimizer)
         scaler.update()
 
-        if (i % 100) == 0:
+        if (i % 500) == 0:
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), time.time() - start))
             start = time.time()
