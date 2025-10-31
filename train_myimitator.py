@@ -11,6 +11,8 @@ import torch.optim as optim
 import torch.utils.data
 from torchvision import transforms as T
 from torch.utils.data import DataLoader, Dataset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import json
 import torchvision.utils as vutils
 import numpy as np
@@ -102,11 +104,24 @@ if os.path.exists(val_index_file):
 else:
     val_dataset = None
 
+### Distributed samplers for DDP
+train_sampler = None
+val_sampler = None
+if get_world_size() > 1:
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=True, drop_last=False
+    )
+    if val_dataset is not None:
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=False, drop_last=False
+        )
+
 train_dataloader = DataLoader(
     train_dataset,
     batch_size=batch_size,
-    shuffle=True,
-    num_workers=4,
+    shuffle=(train_sampler is None),
+    sampler=train_sampler,
+    num_workers=8,
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,
@@ -115,7 +130,8 @@ val_dataloader = DataLoader(
     val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=2,
+    sampler=val_sampler,
+    num_workers=4,
     pin_memory=True,
     persistent_workers=True,
 ) if val_dataset is not None else None
@@ -127,7 +143,41 @@ os.makedirs(preview_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def init_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not is_dist_avail_and_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=backend, init_method="env://")
+        return local_rank
+    return 0
+
+
+local_rank = init_distributed()
+device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
+cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 
 
 
@@ -409,9 +459,21 @@ class BigGANConfig(object):
 
 
 imitator = MyImitator()
-if device.type == 'cuda':
-    imitator = nn.DataParallel(imitator)
+
+# Convert BN to SyncBN for multi-GPU stability
+if get_world_size() > 1:
+    imitator = nn.SyncBatchNorm.convert_sync_batchnorm(imitator)
+
 imitator.to(device)
+
+# Wrap with DistributedDataParallel if distributed
+if get_world_size() > 1:
+    imitator = DDP(
+        imitator,
+        device_ids=[local_rank] if device.type == 'cuda' else None,
+        output_device=local_rank if device.type == 'cuda' else None,
+        find_unused_parameters=False,
+    )
 
 # Initialize BCELoss function
 criterion = nn.L1Loss()
@@ -467,6 +529,8 @@ best_val_loss = float('inf')
 epochs_no_improve = 0
 for epoch in range(num_epochs):
     start = time.time()
+    if 'train_sampler' in globals() and train_sampler is not None:
+        train_sampler.set_epoch(epoch)
     for i, (params, img) in enumerate(train_dataloader):
         optimizer.zero_grad()
         params = params.to(device)
@@ -480,57 +544,76 @@ for epoch in range(num_epochs):
         # Step LR scheduler per update
         scheduler.step()
 
-        if (i % 500) == 0:
+        if (i % 500) == 0 and (not is_dist_avail_and_initialized() or is_main_process()):
             current_lr = optimizer.param_groups[0]['lr']
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, LR: {:.6e}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), current_lr, time.time() - start))
             start = time.time()
 
-    train_loss_list.append(loss.item())
+    if not is_dist_avail_and_initialized() or is_main_process():
+        train_loss_list.append(loss.item())
     imitator.eval()
     with torch.no_grad():
-        val_loss = 0
+        val_loss_sum = 0.0
+        nbatches = 0
         for i, (params, img) in enumerate(val_dataloader):
             params = params.to(device)
             img = img.to(device)
             with autocast(enabled=use_amp):
                 outputs = imitator(params)
                 loss = criterion(outputs, img)
-            val_loss += loss.item()
+            val_loss_sum += loss.item()
+            nbatches += 1
 
-            if i == 1:
+            if i == 1 and (not is_dist_avail_and_initialized() or is_main_process()):
                 vutils.save_image(
                     vutils.make_grid(outputs.to(device)[:16], nrow=4, padding=2, normalize=True).cpu(),
                     os.path.join(preview_dir, f"{epoch}.jpg"))
-        val_loss = val_loss / len(val_dataloader)
-        val_loss_list.append(val_loss)
-
-        print('Epoch [{}/{}], val_loss: {:.6f}'
-              .format(epoch + 1, num_epochs, val_loss))
-
-        # Early stopping tracking and best model saving
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            torch.save(imitator.state_dict(), os.path.join(model_dir, 'best_epoch_{}_val_loss_{:.6f}.pt'.format(epoch, val_loss)))
+        # Reduce across processes to get global mean validation loss
+        if is_dist_avail_and_initialized():
+            tensor = torch.tensor([val_loss_sum, nbatches], dtype=torch.float64, device=device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            val_loss = (tensor[0] / tensor[1]).item()
         else:
-            epochs_no_improve += 1
-        if (epoch % 10) == 0 or (epoch+1) == num_epochs:
-            torch.save(imitator.state_dict(),
-                       os.path.join(model_dir, 'epoch_{}_val_loss_{:.6f}_file.pt'.format(
-                           epoch, val_loss)))
-        if epoch >= 1:
-            plt.figure()
-            plt.subplot(121)
-            plt.plot(np.arange(0, len(train_loss_list)), train_loss_list)
-            plt.subplot(122)
-            plt.plot(np.arange(0, len(val_loss_list)), val_loss_list)
-            plt.savefig(metrics_path)
-            plt.close("all")
+            val_loss = val_loss_sum / max(1, nbatches)
+        if not is_dist_avail_and_initialized() or is_main_process():
+            val_loss_list.append(val_loss)
+
+            print('Epoch [{}/{}], val_loss: {:.6f}'
+                  .format(epoch + 1, num_epochs, val_loss))
+
+            # Early stopping tracking and best model saving
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                model_to_save = imitator.module if hasattr(imitator, 'module') else imitator
+                torch.save(model_to_save.state_dict(), os.path.join(model_dir, 'best_epoch_{}_val_loss_{:.6f}.pt'.format(epoch, val_loss)))
+            else:
+                epochs_no_improve += 1
+            if (epoch % 10) == 0 or (epoch+1) == num_epochs:
+                model_to_save = imitator.module if hasattr(imitator, 'module') else imitator
+                torch.save(model_to_save.state_dict(),
+                           os.path.join(model_dir, 'epoch_{}_val_loss_{:.6f}_file.pt'.format(
+                               epoch, val_loss)))
+            if epoch >= 1:
+                plt.figure()
+                plt.subplot(121)
+                plt.plot(np.arange(0, len(train_loss_list)), train_loss_list)
+                plt.subplot(122)
+                plt.plot(np.arange(0, len(val_loss_list)), val_loss_list)
+                plt.savefig(metrics_path)
+                plt.close("all")
 
     imitator.train()
 
     # Trigger early stopping if no improvement for `early_stop_patience` epochs
-    if epochs_no_improve >= early_stop_patience:
+    stop_training = False
+    if (not is_dist_avail_and_initialized() or is_main_process()) and epochs_no_improve >= early_stop_patience:
         print(f"Early stopping triggered after {early_stop_patience} epochs without improvement. Best val_loss: {best_val_loss:.6f}")
+        stop_training = True
+    if is_dist_avail_and_initialized():
+        flag_tensor = torch.tensor([1 if stop_training else 0], device=device)
+        dist.broadcast(flag_tensor, src=0)
+        stop_training = bool(flag_tensor.item())
+    if stop_training:
         break
