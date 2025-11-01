@@ -35,7 +35,7 @@ random.seed(manualSeed)
 torch.manual_seed(manualSeed)
 
 # Batch size during training
-batch_size = 16
+batch_size = 32
 image_size = 512
 num_epochs = 500
 lr = 0.01
@@ -71,6 +71,44 @@ DEFAULT_IMG_TRANSFORM = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 再映射到 [-1,1]
 ])
+
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def init_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not is_dist_avail_and_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=backend, init_method="env://")
+        return local_rank
+    return 0
+
+
+local_rank = init_distributed()
+device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
+cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
+
 
 class Imitator_Dataset(Dataset):
     def __init__(self, params_root, image_root, index_file, transform=None):
@@ -143,41 +181,6 @@ os.makedirs(preview_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 
 
-def is_dist_avail_and_initialized():
-    return dist.is_available() and dist.is_initialized()
-
-
-def get_rank():
-    return dist.get_rank() if is_dist_avail_and_initialized() else 0
-
-
-def get_world_size():
-    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
-
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def init_distributed():
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size > 1 and not is_dist_avail_and_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend, init_method="env://")
-        return local_rank
-    return 0
-
-
-local_rank = init_distributed()
-device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
-cudnn.benchmark = True
-try:
-    torch.set_float32_matmul_precision('high')
-except Exception:
-    pass
 
 
 
@@ -459,11 +462,6 @@ class BigGANConfig(object):
 
 
 imitator = MyImitator()
-
-# Convert BN to SyncBN for multi-GPU stability
-if get_world_size() > 1:
-    imitator = nn.SyncBatchNorm.convert_sync_batchnorm(imitator)
-
 imitator.to(device)
 
 # Wrap with DistributedDataParallel if distributed
@@ -479,7 +477,8 @@ if get_world_size() > 1:
 criterion = nn.L1Loss()
 
 # optimizer = optim.SGD(imitator.parameters(), lr=lr, momentum=0.9)
-optimizer = optim.Adam(params=imitator.parameters(), lr=5e-5,
+# lr is adjusted based on 8 GPUs
+optimizer = optim.Adam(params=imitator.parameters(), lr=4e-4,
                            betas=(0.0, 0.999), weight_decay=0,
                            eps=1e-8)
 
@@ -524,7 +523,7 @@ train_loss_list = []
 val_loss_list = []
 
 # Early stopping state
-early_stop_patience = 10
+early_stop_patience = 100
 best_val_loss = float('inf')
 epochs_no_improve = 0
 for epoch in range(num_epochs):
@@ -544,7 +543,7 @@ for epoch in range(num_epochs):
         # Step LR scheduler per update
         scheduler.step()
 
-        if (i % 500) == 0 and (not is_dist_avail_and_initialized() or is_main_process()):
+        if (i % 100) == 0 and (not is_dist_avail_and_initialized() or is_main_process()):
             current_lr = optimizer.param_groups[0]['lr']
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, LR: {:.6e}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), current_lr, time.time() - start))
