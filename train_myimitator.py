@@ -268,12 +268,15 @@ class BigGANBatchNorm(nn.Module):
 
         if conditional:
             assert condition_vector_dim is not None
-            self.bn = nn.BatchNorm2d(num_features, affine=False, eps=eps)
+            # self.bn = nn.BatchNorm2d(num_features, affine=False, eps=eps)
+            self.bn = nn.GroupNorm(num_groups=32, num_channels=num_features, eps=eps, affine=False)
+
             # 使用光谱归一化的线性层以稳定训练
             self.gamma = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=True, eps=eps)
             self.beta = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=True, eps=eps)
         else:
-            self.bn = nn.BatchNorm2d(num_features, affine=True, eps=eps)
+            # self.bn = nn.BatchNorm2d(num_features, affine=True, eps=eps)
+            self.bn = nn.GroupNorm(num_groups=32, num_channels=num_features, eps=eps, affine=True)
 
     def forward(self, x, truncation, condition_vector=None):
         out = self.bn(x)
@@ -474,11 +477,24 @@ if get_world_size() > 1:
     )
 
 # Initialize BCELoss function
-criterion = nn.L1Loss()
+# criterion = nn.L1Loss()
+
+# 替换Loss
+class CharbonnierLoss(torch.nn.Module):
+    def __init__(self, eps=1e-3, reduction="mean"):
+        super().__init__()
+        self.eps, self.reduction = eps, reduction
+    def forward(self, pred, target):
+        diff = pred - target
+        loss = torch.sqrt(diff * diff + self.eps * self.eps)
+        return loss.mean() if self.reduction == "mean" else loss
+
+criterion = CharbonnierLoss(eps=1e-3)
+
 
 # optimizer = optim.SGD(imitator.parameters(), lr=lr, momentum=0.9)
 # lr is adjusted based on 8 GPUs
-optimizer = optim.Adam(params=imitator.parameters(), lr=4e-4,
+optimizer = optim.Adam(params=imitator.parameters(), lr=6e-4,
                            betas=(0.0, 0.999), weight_decay=0,
                            eps=1e-8)
 
@@ -518,6 +534,8 @@ scheduler = get_cosine_schedule_with_warmup(
     num_training_steps=num_training_steps,
     num_cycles=0.5,
 )
+
+
 imitator.train()
 train_loss_list = []
 val_loss_list = []
@@ -543,7 +561,7 @@ for epoch in range(num_epochs):
         # Step LR scheduler per update
         scheduler.step()
 
-        if (i % 100) == 0 and (not is_dist_avail_and_initialized() or is_main_process()):
+        if (i % 50) == 0 and (not is_dist_avail_and_initialized() or is_main_process()):
             current_lr = optimizer.param_groups[0]['lr']
             print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, LR: {:.6e}, spend time: {:.4f}'
                   .format(epoch + 1, num_epochs, i + 1, total_step, loss.item(), current_lr, time.time() - start))
